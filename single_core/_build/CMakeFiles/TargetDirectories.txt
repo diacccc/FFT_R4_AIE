@@ -1,0 +1,3 @@
+/home/diac/private/mlir-aie/my_implementation/basic/fft_r4/single_core/_build/CMakeFiles/single_core.dir
+/home/diac/private/mlir-aie/my_implementation/basic/fft_r4/single_core/_build/CMakeFiles/edit_cache.dir
+/home/diac/private/mlir-aie/my_implementation/basic/fft_r4/single_core/_build/CMakeFiles/rebuild_cache.dir
