@@ -4,176 +4,162 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Copyright (C) 2025, Advanced Micro Devices, Inc.
-// 
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc.
+//
 //===----------------------------------------------------------------------===//-->
 
-# FFT Implementation for AIE Using GEMM-based Approach
+# Radix-4 Stockham FFT (Single Core AIE)
 
-This directory contains an FFT (Fast Fourier Transform) implementation for AMD AIE (AI Engine) devices that leverages the low-precision GEMM hardware for high-precision scientific computing.
+This directory contains a single-core AI Engine implementation of a **radix-4 Stockham FFT** for complex `f32` input/output, with twiddle factors stored as pre-split `bf16` slices.
 
-## Overview
+The implementation is designed for MLIR-AIE flows and includes:
+- AIE kernel code (`kernels/fft_stockham_f32.cc`)
+- MLIR design generator (`single_core/single_core.py`)
+- Host test and verification against FFTW (`test.cpp`)
 
-The FFT implementation uses a novel GEMM-based approach to perform discrete Fourier transform on complex-valued input data:
-- **Input signal**: Complex float32 - 2 values per sample (real + imaginary)
-- **Twiddle factors**: Complex float32 - 2 values per factor (real + imaginary)
-- **Output signal**: Complex float32 - 2 values per sample (real + imaginary)
+## What Is Implemented
 
-### GEMM-Based Complex Multiplication with Ozaki Scheme
+- FFT algorithm: **radix-4 DIT Stockham autosort**
+- Data type path:
+   - Input samples: complex `f32` (`[real, imag]` interleaved)
+   - Twiddles: complex values represented as `8 x bf16` (4 real slices + 4 imag slices)
+   - Output samples: complex `f32`
+- Complex twiddle multiplication uses an Ozaki-style split/accumulate path:
+   - Each scalar float is split into 4 `bf16` values.
+   - Products are reconstructed by summing all pairwise slice products.
+- Butterfly stage is also organized in a GEMM-friendly BF16 form:
+   - Twiddle-multiplied values are re-split into 4 `bf16` slices per scalar.
+   - The radix-4 butterfly is expressed as an 8x8 real matvec (complex-expanded W4 matrix).
+   - Matrix terms are accumulated with split-pair products, matching a 16-term split multiply structure.
 
-The key innovation is performing complex multiplication using the Ozaki scheme with bfloat16 hardware:
+## Directory Layout
 
-1. **Float Splitting**: Each float32 value is split into 4 bfloat16 slices using error-free transformation:
-   ```
-   a = (float)a_0 + (float)a_1 + (float)a_2 + (float)a_3
-   ```
-   where a_0, a_1, a_2, a_3 are bfloat16 values.
+- `kernels/fft_stockham_f32.cc`
+   - Core radix-4 Stockham kernel.
+   - Exposes `fft_stockham_f32` and `zero_f32`.
+- `single_core/single_core.py`
+   - Creates the single-core AIE graph (shim/mem/core tiles, object FIFOs, runtime sequence).
+- `single_core/Makefile`
+   - Main entry point for build/run in this design.
+- `test.cpp`
+   - Host-side XRT app.
+   - Generates random complex input and packed twiddles.
+   - Verifies against FFTW forward FFT.
+- `makefile-common`
+   - Shared make logic used by this design.
 
-2. **Pairwise Multiplication**: For complex multiplication (a + bj) * (c + dj):
-   - Split a, b, c, d into 4 bf16 slices each
-   - Compute ac = Σᵢ Σⱼ (aᵢ × cⱼ) using 16 bf16 multiplications
-   - Compute bd, ad, bc similarly
-   - Result: real = ac - bd, imag = ad + bc
+## FFT and Twiddle Layout
 
-3. **Benefits**:
-   - Uses low-precision (bf16) hardware for high-precision (float32) computation
-   - Each float multiplication becomes 16 bf16 multiplications
-   - These map naturally to 4x8x8 GEMM kernels on AMD AIE-ML2
-   - Maintains numerical accuracy suitable for scientific computing
+### Complex sample layout
 
-The current implementation performs splitting and multiplication in scalar loops. For production use, these operations would be:
-- Vectorized using AIE SIMD instructions
-- Batched across butterfly operations sharing the same twiddle factors
-- Executed via hardware GEMM intrinsics (4x8x8 for AIE-ML2)
+Input and output buffers use interleaved complex storage:
 
-## Files
+```text
+[real_0, imag_0, real_1, imag_1, ..., real_(N-1), imag_(N-1)]
+```
 
-**Kernel Implementation:**
-- **kernels/fft_gemm_f32.cc** - GEMM-based FFT kernel with float splitting
+### Twiddle layout (stage-major, q-lane packed)
 
-**Host Code:**
-- **test.cpp** - Host test code for FFT execution and verification (uses FFTW3 for reference)
+For each stage with stride `s = 4^stage`, each `q` lane stores 3 twiddles:
+- `W^(q*m)`
+- `W^(2*q*m)`
+- `W^(3*q*m)`
 
-**MLIR Design:**
-- **single_core/single_core.py** - MLIR code generator for single-core FFT design
-- **single_core/Makefile** - Build configuration
+where `m = N / (4^(stage+1))`.
 
-**Build System:**
-- **makefile-common** - Common build settings
-- **CMakeLists.txt** - CMake configuration with FFTW3 support
+Each complex twiddle is stored as 8 bf16 values:
+- `real_split0..3`
+- `imag_split0..3`
 
-## Usage
+So each stage consumes `24 * s` bf16 elements.
 
-### Building
+## Kernel Compute Organization (Vectorization-Friendly)
 
-From the `single_core` directory:
+Each radix-4 butterfly is implemented in two scalar stages that mirror the intended vectorized path:
+
+1. Twiddle elementwise multiply in split BF16 form
+- For `b`, `c`, `d`, complex multiplication with stage twiddles is computed as split products (`sum_i sum_j`) over 4-way bf16 slices.
+
+2. BF16 GEMM-style radix-4 butterfly
+- Inputs are arranged as:
+   - `[a_r, a_i, b_r, b_i, c_r, c_i, d_r, d_i]`
+- Butterfly is computed as an 8x8 real matrix multiply to produce:
+   - `[y0_r, y0_i, y1_r, y1_i, y2_r, y2_i, y3_r, y3_i]`
+- This structure is directly aligned with later loop-unrolling and vector-lane GEMM mapping.
+
+## Constraints
+
+- `N` must be a **power of 4** for this radix-4 flow (e.g. 4, 16, 64, 256, 1024, ...).
+- Kernel is currently specialized for `f32` input/output and split `bf16` twiddles.
+- Build requires C++23 support on host (for `std::bfloat16_t` in host code).
+
+## Build and Run
+
+Run all commands from `single_core/`.
+
+### 1. Build
 
 ```bash
-# Build with default FFT size (256)
 make
-
-# Build with custom FFT size (must be power of 2)
-make N=512
-
-# Build with specific device
-make devicename=npu2 N=256
 ```
 
-### Running
+Common variants:
 
 ```bash
-# Run with default parameters
-./single_core.exe
+# Change FFT size
+make N=1024
 
-# Run with custom parameters
-./single_core.exe -v 2 --warmup 1 --iters 10
+# Target device
+make devicename=npu2 N=256
+
+# Use alternative MLIR variants
+env use_placed=1 make
+env use_iron=1 make
 ```
 
-### Parameters
+### 2. Run
 
-- **N**: FFT size (must be a power of 2, default: 256)
-- **dtype_in**: Input data type (fixed to bf16)
-- **dtype_out**: Output data type (fixed to f32)
-- **devicename**: Target device (npu or npu2, default: npu2)
-
-## Implementation Details
-
-### FFT Algorithm
-
-The implementation uses the **Cooley-Tukey FFT algorithm** (Radix-2 Decimation-in-Time):
-
-1. **Bit-reversal permutation**: Reorder input data
-2. **Butterfly operations**: Log₂(N) stages of butterfly computations
-3. **Twiddle factor multiplication**: Complex multiplication with W[k] = exp(-j*2π*k/N)
-
-The algorithm has O(N log N) complexity, which is significantly more efficient than the naive O(N²) DFT.
-
-**Butterfly operation at each stage:**
-```
-For inputs u and v with twiddle factor w:
-  output_i = u + v*w
-  output_j = u - v*w
+```bash
+make run
 ```
 
-### Complex Operations
+Tune host runtime options:
 
-Complex multiplication is performed as:
+```bash
+make run verbosity=2 warmup=1 iters=10 N=256
 ```
-(a + bi) * (c + di) = (ac - bd) + (ad + bc)i
+
+### 3. Trace (optional)
+
+```bash
+make trace trace_size=65536 N=256
 ```
 
-### Data Layout
-
-- Input signal: `[real_0, imag_0, real_1, imag_1, ..., real_N-1, imag_N-1]`
-- Twiddle factors: `[real_0, imag_0, real_1, imag_1, ..., real_N-1, imag_N-1]`
-- Output signal: `[real_0, imag_0, real_1, imag_1, ..., real_N-1, imag_N-1]`
-
-## Performance
-
-The current implementation uses the Cooley-Tukey FFT algorithm with O(N log N) complexity. For optimal performance on AIE, the kernel should be further vectorized using SIMD intrinsics.
-
-### Computational Complexity
-
-- **Operations**: O(N log N) with Cooley-Tukey FFT
-  - Stages: log₂(N)
-  - Butterflies per stage: N/2
-  - Total butterflies: (N/2) * log₂(N)
-- **Memory**: O(N) for each buffer (input, twiddle, output)
-- **In-place capable**: Current implementation uses separate input/output buffers
-
-## Future Enhancements
-
-1. **Vectorization**: Implement SIMD operations using AIE intrinsics for butterfly operations
-2. **In-place FFT**: Reduce memory usage by computing FFT in-place
-3. **Radix-4/8**: Implement higher-radix FFT for better performance
-4. **Multi-core**: Distribute FFT computation across multiple AIE cores
-5. **Mixed radix**: Support non-power-of-2 FFT sizes
-6. **Optimized twiddle access**: Cache frequently used twiddle factors
+This generates `trace.txt` and parses it to JSON with the project trace parser.
 
 ## Verification
 
-The host code performs verification by:
-1. Computing a reference FFT on the host using **FFTW3** library
-2. Comparing AIE output against reference with tolerance:
-   - Absolute tolerance: 0.01 (for f32)
-   - Relative tolerance: 0.01 (for f32)
+`test.cpp` verifies AIE output against FFTW (`fftwf_plan_dft_1d`, forward transform):
 
-## Dependencies
+1. Generates random complex input in `[-1, 1]`.
+2. Generates stage-packed twiddles with bf16 splitting.
+3. Runs kernel and reads output buffer.
+4. Computes reference FFT with FFTW.
+5. Compares elementwise with absolute/relative tolerances from `common.h`.
 
-- **FFTW3**: Single-precision FFT library for reference computation
-  - On Ubuntu/Debian: `sudo apt-get install libfftw3-dev`
-  - On other systems: See [FFTW installation guide](http://www.fftw.org/download.html)
+At higher verbosity (`verbosity>=2`), a CSV of expected vs obtained values is emitted as:
 
-## Notes
+```text
+fft_results_N<FFT_SIZE>.csv
+```
 
-- FFT size N must be a power of 2 (required for Radix-2 Cooley-Tukey algorithm)
-- Twiddle factors are pre-computed on the host as: W[k] = cos(2πk/N) - j*sin(2πk/N)
-- The implementation uses bit-reversal permutation for in-order output
-- Cooley-Tukey FFT provides O(N log N) complexity vs O(N²) for naive DFT
-- The implementation is optimized for clarity; further SIMD optimization is possible
+## Performance Notes
 
-## Reference
+- Algorithmic complexity remains `O(N log N)`.
+- This implementation is correctness-first and straightforward to read.
+- The split/accumulate complex multiply is a scalar reference for a GEMM-friendly formulation; further vectorization/intrinsic tuning is expected for peak throughput.
 
-Based on the AIE matrix multiplication examples from:
-- AMD/Xilinx MLIR-AIE repository
-- AIE programming guide
+## Known Practical Notes
+
+- `single_core/README.md` in this folder tree is inherited from a matrix-multiplication template and does not describe this FFT design.
+- Use this README as the source of truth for the current `fft_r4` implementation.

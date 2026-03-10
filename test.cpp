@@ -192,13 +192,12 @@ int main(int argc, const char *argv[]) {
   }
   memcpy(bufInput, InputVec.data(), (InputVec.size() * sizeof(INPUT_DATATYPE)));
   
-  // Radix-4 Twiddle factors packed stage-major for q-lane vectorization:
+  // Radix-4 Twiddle factors packed stage-major with contiguous q-blocks:
   // Each stage has stride s = 4^stage and requires 3 twiddles per q:
   //   W_N^(q*m), W_N^(2*q*m), W_N^(3*q*m) where m = N/(4^(stage+1))
-  // Storage layout per stage (3 twiddles, each size 8*s):
-  // [twiddle1: real_split0(q=0..s-1), ..., real_split3, imag_split0, ..., imag_split3,
-  //  twiddle2: real_split0(q=0..s-1), ..., real_split3, imag_split0, ..., imag_split3,
-  //  twiddle3: real_split0(q=0..s-1), ..., real_split3, imag_split0, ..., imag_split3]
+  // Storage layout per stage (size 24*s):
+  //   for q in [0..s-1], store 24 bf16 values contiguously:
+  //   [tw1 real[4], tw1 imag[4], tw2 real[4], tw2 imag[4], tw3 real[4], tw3 imag[4]]
   TWIDDLE_DATATYPE *bufTwiddle = bo_twiddle.map<TWIDDLE_DATATYPE *>();
   std::vector<TWIDDLE_DATATYPE> TwiddleVec(TWIDDLE_VOLUME);
   const double PI = 3.14159265358979323846;
@@ -235,12 +234,17 @@ int main(int argc, const char *argv[]) {
         split_to_bf16(twiddle_real, real_splits);
         split_to_bf16(twiddle_imag, imag_splits);
 
-        // Store in the stage buffer: 3 twiddles per q, each twiddle is 8 bf16
-        int twiddle_base = stage_twiddle_base + tw * 8 * s;
-        for (int split = 0; split < 4; ++split) {
-          TwiddleVec[twiddle_base + split * s + q] = real_splits[split];
-          TwiddleVec[twiddle_base + (4 + split) * s + q] = imag_splits[split];
-        }
+        // Store in contiguous q-block: 24 bf16 per q (3 twiddles * 8 values)
+        int q_base = stage_twiddle_base + q * 24;
+        int tw_base = q_base + tw * 8;
+        TwiddleVec[tw_base + 0] = real_splits[0];
+        TwiddleVec[tw_base + 1] = real_splits[1];
+        TwiddleVec[tw_base + 2] = real_splits[2];
+        TwiddleVec[tw_base + 3] = real_splits[3];
+        TwiddleVec[tw_base + 4] = imag_splits[0];
+        TwiddleVec[tw_base + 5] = imag_splits[1];
+        TwiddleVec[tw_base + 6] = imag_splits[2];
+        TwiddleVec[tw_base + 7] = imag_splits[3];
       }
     }
     stage_twiddle_base += 24 * s;  // 3 twiddles * 8 bf16 per twiddle
