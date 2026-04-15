@@ -57,6 +57,8 @@ constexpr int verify_stochastic_n_samples = 1000;
 float abs_tol = matmul_common::get_abs_tol<OUTPUT_DATATYPE>();
 float rel_tol = matmul_common::get_rel_tol<OUTPUT_DATATYPE>();
 
+constexpr int kProfilingU64Count = 3;
+
 int main(int argc, const char *argv[]) {
   // Program arguments parsing
   cxxopts::Options options("FFT Test");
@@ -197,7 +199,9 @@ int main(int argc, const char *argv[]) {
   //   W_N^(q*m), W_N^(2*q*m), W_N^(3*q*m) where m = N/(4^(stage+1))
   // Storage layout per stage (size 24*s):
   //   for q in [0..s-1], store 24 bf16 values contiguously:
-  //   [tw1 real[4], tw1 imag[4], tw2 real[4], tw2 imag[4], tw3 real[4], tw3 imag[4]]
+  //   [tw1(r0,i0,r1,i1,r2,i2,r3,i3),
+  //    tw2(r0,i0,r1,i1,r2,i2,r3,i3),
+  //    tw3(r0,i0,r1,i1,r2,i2,r3,i3)]
   TWIDDLE_DATATYPE *bufTwiddle = bo_twiddle.map<TWIDDLE_DATATYPE *>();
   std::vector<TWIDDLE_DATATYPE> TwiddleVec(TWIDDLE_VOLUME);
   const double PI = 3.14159265358979323846;
@@ -238,12 +242,12 @@ int main(int argc, const char *argv[]) {
         int q_base = stage_twiddle_base + q * 24;
         int tw_base = q_base + tw * 8;
         TwiddleVec[tw_base + 0] = real_splits[0];
-        TwiddleVec[tw_base + 1] = real_splits[1];
-        TwiddleVec[tw_base + 2] = real_splits[2];
-        TwiddleVec[tw_base + 3] = real_splits[3];
-        TwiddleVec[tw_base + 4] = imag_splits[0];
-        TwiddleVec[tw_base + 5] = imag_splits[1];
-        TwiddleVec[tw_base + 6] = imag_splits[2];
+        TwiddleVec[tw_base + 1] = imag_splits[0];
+        TwiddleVec[tw_base + 2] = real_splits[1];
+        TwiddleVec[tw_base + 3] = imag_splits[1];
+        TwiddleVec[tw_base + 4] = real_splits[2];
+        TwiddleVec[tw_base + 5] = imag_splits[2];
+        TwiddleVec[tw_base + 6] = real_splits[3];
         TwiddleVec[tw_base + 7] = imag_splits[3];
       }
     }
@@ -310,6 +314,15 @@ int main(int argc, const char *argv[]) {
     if (trace_size > 0)
       bo_trace.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
+    if (verbosity >= 1) {
+      const auto *profile = reinterpret_cast<const unsigned long long *>(bufOut);
+      std::cout << "Kernel cycles total: " << profile[0] << " cycles" << std::endl;
+      std::cout << "Kernel cycles elementwise complex mul: " << profile[1]
+                << " cycles" << std::endl;
+      std::cout << "Kernel cycles butterfly: " << profile[2] << " cycles"
+                << std::endl;
+    }
+
     if (iter < n_warmup_iterations) {
       /* Warmup iterations do not count towards average runtime. */
       continue;
@@ -322,22 +335,25 @@ int main(int argc, const char *argv[]) {
       }
       auto vstart = std::chrono::system_clock::now();
       
-      // Compute reference FFT using FFTW
-      std::vector<OUTPUT_DATATYPE> RefOutput(OUTPUT_VOLUME, 0.0f);
-      
-      // Allocate FFTW arrays
-      fftwf_complex *fft_in = (fftwf_complex*) fftwf_malloc(sizeof(fftwf_complex) * FFT_SIZE);
-      fftwf_complex *fft_out = (fftwf_complex*) fftwf_malloc(sizeof(fftwf_complex) * FFT_SIZE);
+        // Compute reference FFT using double-precision FFTW.
+        std::vector<double> RefOutput(OUTPUT_VOLUME, 0.0);
+
+        // Allocate FFTW arrays (double precision).
+        fftw_complex *fft_in =
+          (fftw_complex *)fftw_malloc(sizeof(fftw_complex) * FFT_SIZE);
+        fftw_complex *fft_out =
+          (fftw_complex *)fftw_malloc(sizeof(fftw_complex) * FFT_SIZE);
       
       // Copy input data to FFTW format
       for (int i = 0; i < FFT_SIZE; i++) {
-        fft_in[i][0] = float(InputVec[2*i]);     // real part
-        fft_in[i][1] = float(InputVec[2*i+1]);   // imaginary part
+        fft_in[i][0] = static_cast<double>(InputVec[2 * i]);     // real part
+        fft_in[i][1] = static_cast<double>(InputVec[2 * i + 1]); // imaginary part
       }
-      
-      // Create FFTW plan and execute
-      fftwf_plan plan = fftwf_plan_dft_1d(FFT_SIZE, fft_in, fft_out, FFTW_FORWARD, FFTW_ESTIMATE);
-      fftwf_execute(plan);
+
+      // Create FFTW plan and execute.
+      fftw_plan plan =
+          fftw_plan_dft_1d(FFT_SIZE, fft_in, fft_out, FFTW_FORWARD, FFTW_ESTIMATE);
+      fftw_execute(plan);
       
       // Copy FFTW output to RefOutput
       for (int i = 0; i < FFT_SIZE; i++) {
@@ -345,24 +361,32 @@ int main(int argc, const char *argv[]) {
         RefOutput[2*i+1] = fft_out[i][1];   // imaginary part
       }
       
-      // Clean up FFTW
-      fftwf_destroy_plan(plan);
-      fftwf_free(fft_in);
-      fftwf_free(fft_out);
+      // Clean up FFTW.
+      fftw_destroy_plan(plan);
+      fftw_free(fft_in);
+      fftw_free(fft_out);
       
       // Compare results
       errors = 0;
-      float max_abs_error = 0.0f;
-      float min_abs_error = std::numeric_limits<float>::max();
-      float max_rel_error = 0.0f;
+      double max_abs_error = 0.0;
+      double min_abs_error = std::numeric_limits<double>::max();
+      double max_rel_error = 0.0;
       int max_abs_error_idx = 0;
       int min_abs_error_idx = 0;
       int max_rel_error_idx = 0;
+      const int profile_words =
+          (kProfilingU64Count * static_cast<int>(sizeof(unsigned long long)) +
+           static_cast<int>(sizeof(OUTPUT_DATATYPE)) - 1) /
+          static_cast<int>(sizeof(OUTPUT_DATATYPE));
       
       for (int i = 0; i < OUTPUT_VOLUME; i++) {
-        float diff = std::abs(OutputVec[i] - RefOutput[i]);
-        float ref_val = std::abs(RefOutput[i]);
-        float rel_error = (ref_val > 1e-10f) ? (diff / ref_val) : 0.0f;
+        if (i < profile_words)
+          continue;
+
+        double out_val = static_cast<double>(OutputVec[i]);
+        double diff = std::abs(out_val - RefOutput[i]);
+        double ref_val = std::abs(RefOutput[i]);
+        double rel_error = (ref_val > 1e-12) ? (diff / ref_val) : 0.0;
         
         // Track maximum and minimum errors
         if (diff > max_abs_error) {
@@ -407,18 +431,23 @@ int main(int argc, const char *argv[]) {
           for (int i = 0; i < FFT_SIZE; i++) {
             int real_idx = 2*i;
             int imag_idx = 2*i + 1;
+
+            if (real_idx < profile_words || imag_idx < profile_words)
+              continue;
             
-            float real_expected = RefOutput[real_idx];
-            float real_obtained = OutputVec[real_idx];
-            float real_abs_error = std::abs(real_obtained - real_expected);
-            float real_rel_error = (std::abs(real_expected) > 1e-10f) ? 
-                                   (real_abs_error / std::abs(real_expected)) : 0.0f;
-            
-            float imag_expected = RefOutput[imag_idx];
-            float imag_obtained = OutputVec[imag_idx];
-            float imag_abs_error = std::abs(imag_obtained - imag_expected);
-            float imag_rel_error = (std::abs(imag_expected) > 1e-10f) ? 
-                                   (imag_abs_error / std::abs(imag_expected)) : 0.0f;
+            double real_expected = RefOutput[real_idx];
+            double real_obtained = static_cast<double>(OutputVec[real_idx]);
+            double real_abs_error = std::abs(real_obtained - real_expected);
+            double real_rel_error = (std::abs(real_expected) > 1e-12)
+                                        ? (real_abs_error / std::abs(real_expected))
+                                        : 0.0;
+
+            double imag_expected = RefOutput[imag_idx];
+            double imag_obtained = static_cast<double>(OutputVec[imag_idx]);
+            double imag_abs_error = std::abs(imag_obtained - imag_expected);
+            double imag_rel_error = (std::abs(imag_expected) > 1e-12)
+                                        ? (imag_abs_error / std::abs(imag_expected))
+                                        : 0.0;
             
             // Write real part
             csv_file << real_idx << "," << i << ",Real,"

@@ -10,8 +10,6 @@
 
 #define NOCPP
 
-#include <stdio.h>
-#include <stdlib.h>
 #include <aie_api/aie.hpp>
 
 #ifndef FFT_SIZE
@@ -19,16 +17,18 @@
 #endif
 
 // Radix-4 FFT requires N to be a power of 4
-static_assert((FFT_SIZE & (FFT_SIZE - 1)) == 0, "FFT_SIZE must be a power of 2");
-// Additional runtime check will verify it's a power of 4
 
-// Zero initialization for output buffer
-template <typename T_out, unsigned size>
-static inline void zero_float(T_out *__restrict c) {
-  for (unsigned i = 0; i < size; i++) {
-    c[i] = 0.0f;
-  }
-}
+#define PROFILING 1
+
+
+static volatile unsigned long long g_fft_stockham_cycles = 0;
+static volatile unsigned long long g_fft_elemwise_cycles = 0;
+static volatile unsigned long long g_fft_butterfly_cycles = 0;
+
+constexpr unsigned kSplitCount = 4;
+constexpr unsigned kTwiddlesPerQ = 3;
+constexpr unsigned kComplexSplitWidth = 8; // [r0,i0,r1,i1,r2,i2,r3,i3]
+constexpr unsigned kTwiddleBlockPerQ = kTwiddlesPerQ * kComplexSplitWidth;
 
 template <typename T_out, unsigned size>
 static inline void zero_vectorized(T_out *__restrict c) {
@@ -41,140 +41,11 @@ static inline void zero_vectorized(T_out *__restrict c) {
   }
 }
 
-// Compute log2 of N at compile time
-constexpr unsigned log2_const(unsigned n) {
-  return (n <= 1) ? 0 : 1 + log2_const(n / 2);
-}
-
 // Compute log4 of N at compile time
 constexpr unsigned log4_const(unsigned n) {
   return (n <= 1) ? 0 : 1 + log4_const(n / 4);
 }
 
-// Split a float into 4 bfloat16 slices
-// Using error-free transformation (EFT)
-// f = f0 + f1 + f2 + f3 where f0, f1, f2, f3 are representable in bfloat16
-static inline void split_float_to_bf16(float f, bfloat16 splits[4]) {
-  float remainder = f;
-  
-  for (int i = 0; i < 4; i++) {
-    bfloat16 bf = (bfloat16)remainder;
-    splits[i] = bf;
-    remainder = remainder - (float)bf;
-  }
-}
-
-// Emulated bf16 multiply between two split-4 values:
-// (a0+a1+a2+a3) * (b0+b1+b2+b3) = sum_i sum_j ai*bj
-static inline float mul_split4(const bfloat16 a_splits[4],
-                               const bfloat16 b_splits[4]) {
-  float acc = 0.0f;
-  for (int i = 0; i < 4; i++) {
-    for (int j = 0; j < 4; j++) {
-      acc += (float)a_splits[i] * (float)b_splits[j];
-    }
-  }
-  return acc;
-}
-
-// Complex multiplication using GEMM-based method with float splitting
-// Computes (a + bj) * (c + dj) where:
-//   - a, b are floats (split on-the-fly)
-//   - c, d are pre-split into bf16 arrays
-// Returns result in (real, imag) as floats
-//
-// Ozaki scheme: When a = a0+a1+a2+a3 and c = c0+c1+c2+c3,
-// then a*c = sum_i sum_j (a_i * c_j)
-static __attribute__((noinline)) void complex_mul_gemm(
-  float a, float b,
-  const bfloat16 c_splits[4],
-  const bfloat16 d_splits[4],
-  float &result_real, float &result_imag) {
-  // Split input values (a, b) into bf16 slices
-  bfloat16 a_splits[4], b_splits[4];
-  split_float_to_bf16(a, a_splits);
-  split_float_to_bf16(b, b_splits);
-  
-  // Compute (a + bj) * (c + dj) = (ac - bd) + (ad + bc)j
-  // using Ozaki scheme: compute all pairwise products
-  
-  // Real part: ac - bd
-  const float ac = mul_split4(a_splits, c_splits);
-  const float bd = mul_split4(b_splits, d_splits);
-  result_real = ac - bd;
-  
-  // Imaginary part: ad + bc
-  const float ad = mul_split4(a_splits, d_splits);
-  const float bc = mul_split4(b_splits, c_splits);
-  result_imag = ad + bc;
-}
-
-// BF16-split GEMM-style radix-4 butterfly.
-// Input vector order is:
-//   [a_r, a_i, b_r, b_i, c_r, c_i, d_r, d_i]
-// and output vector order is:
-//   [y0_r, y0_i, y1_r, y1_i, y2_r, y2_i, y3_r, y3_i]
-//
-// The fixed 8x8 real matrix is the real-expanded W4 butterfly matrix.
-// We split both input values and matrix coefficients into 4 bf16 slices,
-// then accumulate sum_i sum_j products for every matrix multiply term.
-static __attribute__((noinline)) void butterfly_gemm_bf16(
-  float a_real, float a_imag,
-  float b_real, float b_imag,
-  float c_real, float c_imag,
-  float d_real, float d_imag,
-  float &y0_real, float &y0_imag,
-  float &y1_real, float &y1_imag,
-  float &y2_real, float &y2_imag,
-  float &y3_real, float &y3_imag) {
-  static const float butterfly_coeff[8][8] = {
-      {1, 0, 1, 0, 1, 0, 1, 0},
-      {0, 1, 0, 1, 0, 1, 0, 1},
-      {1, 0, 0, 1, -1, 0, 0, -1},
-      {0, 1, -1, 0, 0, -1, 1, 0},
-      {1, 0, -1, 0, 1, 0, -1, 0},
-      {0, 1, 0, -1, 0, 1, 0, -1},
-      {1, 0, 0, -1, -1, 0, 0, 1},
-      {0, 1, 1, 0, 0, -1, -1, 0},
-  };
-
-  static bool coeff_ready = false;
-  static bfloat16 butterfly_coeff_splits[8][8][4];
-  if (!coeff_ready) {
-    for (unsigned row = 0; row < 8; ++row) {
-      for (unsigned col = 0; col < 8; ++col) {
-        split_float_to_bf16(butterfly_coeff[row][col],
-                            butterfly_coeff_splits[row][col]);
-      }
-    }
-    coeff_ready = true;
-  }
-
-  float x_vals[8] = {a_real, a_imag, b_real, b_imag,
-                     c_real, c_imag, d_real, d_imag};
-  bfloat16 x_splits[8][4];
-  for (unsigned k = 0; k < 8; ++k) {
-    split_float_to_bf16(x_vals[k], x_splits[k]);
-  }
-
-  float y_vals[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-  for (unsigned row = 0; row < 8; ++row) {
-    float acc = 0.0f;
-    for (unsigned col = 0; col < 8; ++col) {
-      acc += mul_split4(x_splits[col], butterfly_coeff_splits[row][col]);
-    }
-    y_vals[row] = acc;
-  }
-
-  y0_real = y_vals[0];
-  y0_imag = y_vals[1];
-  y1_real = y_vals[2];
-  y1_imag = y_vals[3];
-  y2_real = y_vals[4];
-  y2_imag = y_vals[5];
-  y3_real = y_vals[6];
-  y3_imag = y_vals[7];
-}
 
 // Radix-4 Stockham FFT Algorithm
 // ============================================================================
@@ -199,9 +70,109 @@ static inline void fft_stockham_gemm(float *__restrict x,
                                       const bfloat16 *__restrict twiddle,
                                       float *__restrict y) {
   constexpr unsigned LOG4N = log4_const(N);
-  unsigned stage_twiddle_base = 0;
+  unsigned long long elemwise_cycles = 0;
+  unsigned long long butterfly_cycles = 0;
 
-  for (unsigned stage = 0; stage < LOG4N; ++stage) {
+  // Stage 0 has s=1 and q=0 only, so no twiddle factors are needed.
+  if constexpr (LOG4N > 0) {
+    constexpr unsigned Q_TILE = 4;
+    constexpr unsigned stage0 = 0;
+    const unsigned n = N >> (2 * stage0);  // n = N
+    const unsigned s = 1u << (2 * stage0); // s = 1
+    const unsigned m = n >> 2;             // m = N / 4
+
+    float butterfly_in[Q_TILE][8];
+    float butterfly_out[Q_TILE][8];
+
+    for (unsigned p0 = 0; p0 < m; p0 += Q_TILE) {
+      const unsigned p_lim = ((p0 + Q_TILE) < m) ? (p0 + Q_TILE) : m;
+      const unsigned rows = p_lim - p0;
+
+      for (unsigned p = p0; p < p_lim; ++p) {
+        const unsigned t = p - p0;
+        const unsigned idx_a = 0 + s * (p + 0 * m);
+        const unsigned idx_b = 0 + s * (p + 1 * m);
+        const unsigned idx_c = 0 + s * (p + 2 * m);
+        const unsigned idx_d = 0 + s * (p + 3 * m);
+
+        const float a_real = x[2 * idx_a];
+        const float a_imag = x[2 * idx_a + 1];
+        const float b_real = x[2 * idx_b];
+        const float b_imag = x[2 * idx_b + 1];
+        const float c_real = x[2 * idx_c];
+        const float c_imag = x[2 * idx_c + 1];
+        const float d_real = x[2 * idx_d];
+        const float d_imag = x[2 * idx_d + 1];
+
+        butterfly_in[t][0] = a_real;
+        butterfly_in[t][1] = a_imag;
+        butterfly_in[t][2] = b_real;
+        butterfly_in[t][3] = b_imag;
+        butterfly_in[t][4] = c_real;
+        butterfly_in[t][5] = c_imag;
+        butterfly_in[t][6] = d_real;
+        butterfly_in[t][7] = d_imag;
+      }
+      unsigned long long butterfly_start = 0;
+      if constexpr (PROFILING) {
+        butterfly_start = get_cycles();
+      }
+
+      alignas(aie::vector_decl_align) static bfloat16 coeff_buf[64] = {
+        1,  0,  1,  0,  1,  0,  1,  0,
+        0,  1,  0,  1,  0,  1,  0,  1,
+        1,  0,  0, -1, -1,  0,  0,  1,
+        0,  1,  1,  0,  0, -1, -1,  0,
+        1,  0, -1,  0,  1,  0, -1,  0,
+        0,  1,  0, -1,  0,  1,  0, -1,
+        1,  0,  0,  1, -1,  0,  0, -1,
+        0,  1, -1,  0,  0, -1,  1,  0,
+      };
+      aie::vector<bfloat16, 64> coeff_vecs;
+      coeff_vecs = aie::load_v<64>(coeff_buf);
+      aie::accum<accfloat, 32> in_vecs;
+      in_vecs = aie::load_v<32>(&butterfly_in[0][0]);
+      aie::accum<accfloat, 32> tmp_splits;
+
+      using MMUL = aie::mmul<4, 8, 8, bfloat16, bfloat16, accfloat>;
+      MMUL OUT;
+      aie::vector<bfloat16, 32> in_splits = in_vecs.template to_vector<bfloat16>();
+      OUT.mul(in_splits, coeff_vecs);
+      for (unsigned k = 1; k < kSplitCount; ++k) {
+        tmp_splits.from_vector(in_splits);
+        in_vecs = aie::sub(in_vecs, tmp_splits);
+        in_splits = in_vecs.template to_vector<bfloat16>();
+        OUT.mac(in_splits, coeff_vecs);
+      }
+      aie::store_v(&butterfly_out[0][0], OUT.template to_vector<float>());
+
+      if constexpr (PROFILING) {
+        butterfly_cycles += get_cycles() - butterfly_start;
+      }
+      
+      for (unsigned p = p0; p < p_lim; ++p) {
+        const unsigned t = p - p0;
+        const unsigned out_idx0 = 0 + s * (4 * p + 0);
+        const unsigned out_idx1 = 0 + s * (4 * p + 1);
+        const unsigned out_idx2 = 0 + s * (4 * p + 2);
+        const unsigned out_idx3 = 0 + s * (4 * p + 3);
+
+        y[2 * out_idx0] = butterfly_out[t][0];
+        y[2 * out_idx0 + 1] = butterfly_out[t][1];
+        y[2 * out_idx1] = butterfly_out[t][2];
+        y[2 * out_idx1 + 1] = butterfly_out[t][3];
+        y[2 * out_idx2] = butterfly_out[t][4];
+        y[2 * out_idx2 + 1] = butterfly_out[t][5];
+        y[2 * out_idx3] = butterfly_out[t][6];
+        y[2 * out_idx3 + 1] = butterfly_out[t][7];
+      }
+    }
+  }
+
+  // Preserve twiddle table compatibility by skipping the stage-0 slot.
+  unsigned stage_twiddle_base = kTwiddleBlockPerQ;
+
+  for (unsigned stage = 1; stage < LOG4N; ++stage) {
     float *src = (stage % 2 == 0) ? x : y;
     float *dst = (stage % 2 == 0) ? y : x;
 
@@ -210,131 +181,166 @@ static inline void fft_stockham_gemm(float *__restrict x,
     const unsigned m = n >> 2;             // m = n / 4
     const bfloat16 *stage_twiddle = &twiddle[stage_twiddle_base];
 
-    // Process all butterflies
-    for (unsigned q = 0; q < s; ++q) {
-      // Load twiddle factors for this q from contiguous 24-bf16 block:
-      // [tw1(r0..r3,i0..i3), tw2(...), tw3(...)]
-      bfloat16 twiddle1_real_splits[4], twiddle1_imag_splits[4];
-      bfloat16 twiddle2_real_splits[4], twiddle2_imag_splits[4];
-      bfloat16 twiddle3_real_splits[4], twiddle3_imag_splits[4];
+    // Scalar q-unrolled format: process 4 q values together for each p.
+    constexpr unsigned Q_TILE = 4;
+    float butterfly_in[Q_TILE][8];
+    float butterfly_out[Q_TILE][8];
+    bfloat16 twiddle_buf[kSplitCount][Q_TILE][8];
 
-      const bfloat16 *twq = stage_twiddle + 24 * q;
-      twiddle1_real_splits[0] = twq[0];
-      twiddle1_real_splits[1] = twq[1];
-      twiddle1_real_splits[2] = twq[2];
-      twiddle1_real_splits[3] = twq[3];
-      twiddle1_imag_splits[0] = twq[4];
-      twiddle1_imag_splits[1] = twq[5];
-      twiddle1_imag_splits[2] = twq[6];
-      twiddle1_imag_splits[3] = twq[7];
+    for (unsigned p = 0; p < m; ++p) {
+      for (unsigned q0 = 0; q0 < s; q0 += Q_TILE) {
+        const unsigned q_lim = ((q0 + Q_TILE) < s) ? (q0 + Q_TILE) : s;
+        const unsigned rows = q_lim - q0;
 
-      twiddle2_real_splits[0] = twq[8];
-      twiddle2_real_splits[1] = twq[9];
-      twiddle2_real_splits[2] = twq[10];
-      twiddle2_real_splits[3] = twq[11];
-      twiddle2_imag_splits[0] = twq[12];
-      twiddle2_imag_splits[1] = twq[13];
-      twiddle2_imag_splits[2] = twq[14];
-      twiddle2_imag_splits[3] = twq[15];
-
-      twiddle3_real_splits[0] = twq[16];
-      twiddle3_real_splits[1] = twq[17];
-      twiddle3_real_splits[2] = twq[18];
-      twiddle3_real_splits[3] = twq[19];
-      twiddle3_imag_splits[0] = twq[20];
-      twiddle3_imag_splits[1] = twq[21];
-      twiddle3_imag_splits[2] = twq[22];
-      twiddle3_imag_splits[3] = twq[23];
-      
-      const bool is_unity_twiddle = (q == 0);
-
-      // Tiled two-phase processing so each butterfly input vector is contiguous
-      // in local memory: [a_r, a_i, b_r, b_i, c_r, c_i, d_r, d_i].
-      constexpr unsigned P_TILE = 4;
-      float butterfly_in[P_TILE][8];
-
-      for (unsigned p0 = 0; p0 < m; p0 += P_TILE) {
-        const unsigned p_lim = ((p0 + P_TILE) < m) ? (p0 + P_TILE) : m;
-
-        // Stage A: gather + twiddle multiply, then pack contiguous butterfly vectors.
-        for (unsigned p = p0; p < p_lim; ++p) {
-          const unsigned t = p - p0;
+        for (unsigned k = 0; k < kSplitCount; ++k) {
+          for (unsigned r = 0; r < Q_TILE; ++r) {
+            for (unsigned c = 0; c < 8; ++c) {
+              twiddle_buf[k][r][c] = (bfloat16)0;
+            }
+          }
+        }
+        
+        for (unsigned q = q0; q < q_lim; ++q) {
+          const unsigned t = q - q0;
           const unsigned idx_a = q + s * (p + 0 * m);
           const unsigned idx_b = q + s * (p + 1 * m);
           const unsigned idx_c = q + s * (p + 2 * m);
           const unsigned idx_d = q + s * (p + 3 * m);
 
-          const float a_real = src[2 * idx_a];
-          const float a_imag = src[2 * idx_a + 1];
-          const float b_real = src[2 * idx_b];
-          const float b_imag = src[2 * idx_b + 1];
-          const float c_real = src[2 * idx_c];
-          const float c_imag = src[2 * idx_c + 1];
-          const float d_real = src[2 * idx_d];
-          const float d_imag = src[2 * idx_d + 1];
-
-          float tb_real, tb_imag, tc_real, tc_imag, td_real, td_imag;
-          if (is_unity_twiddle) {
-            tb_real = b_real;
-            tb_imag = b_imag;
-            tc_real = c_real;
-            tc_imag = c_imag;
-            td_real = d_real;
-            td_imag = d_imag;
-          } else {
-            complex_mul_gemm(b_real, b_imag, twiddle1_real_splits,
-                             twiddle1_imag_splits, tb_real, tb_imag);
-            complex_mul_gemm(c_real, c_imag, twiddle2_real_splits,
-                             twiddle2_imag_splits, tc_real, tc_imag);
-            complex_mul_gemm(d_real, d_imag, twiddle3_real_splits,
-                             twiddle3_imag_splits, td_real, td_imag);
+          const bfloat16 *twq = stage_twiddle + kTwiddleBlockPerQ * q;
+          
+          for (unsigned k = 0; k < kComplexSplitWidth / 2; ++k) {
+            twiddle_buf[k][t][0] = (k == 0) ? (bfloat16)1 : (bfloat16)0;
+            twiddle_buf[k][t][1] = (bfloat16)0;
+            twiddle_buf[k][t][2] = twq[2 * k];
+            twiddle_buf[k][t][3] = twq[2 * k + 1];
+            twiddle_buf[k][t][4] = twq[kComplexSplitWidth + 2 * k];
+            twiddle_buf[k][t][5] = twq[kComplexSplitWidth + 2 * k + 1];
+            twiddle_buf[k][t][6] = twq[2 * kComplexSplitWidth + 2 * k];
+            twiddle_buf[k][t][7] = twq[2 * kComplexSplitWidth + 2 * k + 1];
           }
 
-          butterfly_in[t][0] = a_real;
-          butterfly_in[t][1] = a_imag;
-          butterfly_in[t][2] = tb_real;
-          butterfly_in[t][3] = tb_imag;
-          butterfly_in[t][4] = tc_real;
-          butterfly_in[t][5] = tc_imag;
-          butterfly_in[t][6] = td_real;
-          butterfly_in[t][7] = td_imag;
+          butterfly_in[t][0] = src[2 * idx_a];
+          butterfly_in[t][1] = src[2 * idx_a + 1];
+          butterfly_in[t][2] = src[2 * idx_b];
+          butterfly_in[t][3] = src[2 * idx_b + 1];
+          butterfly_in[t][4] = src[2 * idx_c];
+          butterfly_in[t][5] = src[2 * idx_c + 1];
+          butterfly_in[t][6] = src[2 * idx_d];
+          butterfly_in[t][7] = src[2 * idx_d + 1];
+        }
+        // Element-wise complex multiplication
+        unsigned long long elemwise_start = 0;
+        if constexpr (PROFILING) {
+          elemwise_start = get_cycles();
+        }
+        {
+        aie::accum<accfloat, 32> in_vecs;
+        in_vecs = aie::load_v<32>(&butterfly_in[0][0]);
+        aie::vector<bfloat16, 32> tw_vecs[kSplitCount];
+        for (unsigned i = 0; i < kSplitCount; ++i) {
+          tw_vecs[i] = aie::load_v<32>(&twiddle_buf[i][0][0]);
+        }
+        aie::vector<bfloat16, 32> in_splits = in_vecs.template to_vector<bfloat16>();
+        auto [low, high] = aie::interleave_zip(aie::filter_odd(in_splits, 1), aie::filter_even(in_splits, 1), 1);
+        aie::vector<bfloat16, 32> in_splits_inv = aie::concat(low, high);
+        aie::accum<accfloat, 32> tmp_splits;
+        aie::accum<accfloat, 32> out_vecs_real;
+        aie::accum<accfloat, 32> out_vecs_imag;
+        aie::vector<float, 32> out_vecs;
+        
+        out_vecs_real = aie::mul(in_splits, tw_vecs[0]);
+        out_vecs_imag = aie::mul(in_splits_inv, tw_vecs[0]);
+        for (unsigned i = 1; i < kSplitCount; ++i) {
+          out_vecs_real = aie::mac(out_vecs_real, in_splits, tw_vecs[i]);
+          out_vecs_imag = aie::mac(out_vecs_imag, in_splits_inv, tw_vecs[i]);
+        }
+        for (unsigned k = 1; k < kSplitCount; ++k) {
+          tmp_splits.from_vector(in_splits);
+          in_vecs = aie::sub(in_vecs, tmp_splits);
+          in_splits = in_vecs.template to_vector<bfloat16>();
+          auto [low, high] = aie::interleave_zip(aie::filter_odd(in_splits, 1), aie::filter_even(in_splits, 1), 1);
+          in_splits_inv = aie::concat(low, high);
+          for (unsigned i = 0; i < kSplitCount; ++i) {
+            out_vecs_real = aie::mac(out_vecs_real, in_splits, tw_vecs[i]);
+            out_vecs_imag = aie::mac(out_vecs_imag, in_splits_inv, tw_vecs[i]);
+          }
+        }
+        aie::vector<float, 32> out_vecs_real_flt = out_vecs_real.template to_vector<float>();
+        aie::vector<float, 32> out_vecs_imag_flt = out_vecs_imag.template to_vector<float>();
+        aie::vector<float, 16> real = aie::sub(aie::filter_even(out_vecs_real_flt, 1), aie::filter_odd(out_vecs_real_flt, 1));
+        aie::vector<float, 16> imag = aie::add(aie::filter_even(out_vecs_imag_flt, 1), aie::filter_odd(out_vecs_imag_flt, 1));
+        auto [low_tmp, high_tmp] = aie::interleave_zip(real, imag, 1);
+        out_vecs = aie::concat(low_tmp, high_tmp);
+        aie::store_v(&butterfly_in[0][0], out_vecs);
         }
 
-        // Stage B: contiguous butterfly matmul and scatter.
-        for (unsigned p = p0; p < p_lim; ++p) {
-          const unsigned t = p - p0;
+        if constexpr (PROFILING) {
+          elemwise_cycles += get_cycles() - elemwise_start;
+        }
 
-          float y0_real, y0_imag, y1_real, y1_imag;
-          float y2_real, y2_imag, y3_real, y3_imag;
-          butterfly_gemm_bf16(butterfly_in[t][0], butterfly_in[t][1],
-                              butterfly_in[t][2], butterfly_in[t][3],
-                              butterfly_in[t][4], butterfly_in[t][5],
-                              butterfly_in[t][6], butterfly_in[t][7],
-                              y0_real, y0_imag,
-                              y1_real, y1_imag,
-                              y2_real, y2_imag,
-                              y3_real, y3_imag);
 
+
+        // Butterfly computation using Matrix Multiplication Unit
+        unsigned long long butterfly_start = 0;
+        if constexpr (PROFILING) {
+          butterfly_start = get_cycles();
+        }
+        {
+        alignas(aie::vector_decl_align) static bfloat16 coeff_buf[64] = {
+          1,  0,  1,  0,  1,  0,  1,  0,
+          0,  1,  0,  1,  0,  1,  0,  1,
+          1,  0,  0, -1, -1,  0,  0,  1,
+          0,  1,  1,  0,  0, -1, -1,  0,
+          1,  0, -1,  0,  1,  0, -1,  0,
+          0,  1,  0, -1,  0,  1,  0, -1,
+          1,  0,  0,  1, -1,  0,  0, -1,
+          0,  1, -1,  0,  0, -1,  1,  0,
+        };
+        aie::vector<bfloat16, 64> coeff_vecs;
+        coeff_vecs = aie::load_v<64>(coeff_buf);
+        aie::accum<accfloat, 32> in_vecs;
+        in_vecs = aie::load_v<32>(&butterfly_in[0][0]);
+        aie::accum<accfloat, 32> tmp_splits;
+
+        using MMUL = aie::mmul<4, 8, 8, bfloat16, bfloat16, accfloat>;
+        MMUL OUT;
+        aie::vector<bfloat16, 32> in_splits = in_vecs.template to_vector<bfloat16>();
+        OUT.mul(in_splits, coeff_vecs);
+        for (unsigned k = 1; k < kSplitCount; ++k) {
+          tmp_splits.from_vector(in_splits);
+          in_vecs = aie::sub(in_vecs, tmp_splits);
+          in_splits = in_vecs.template to_vector<bfloat16>();
+          OUT.mac(in_splits, coeff_vecs);
+        }
+        aie::store_v(&butterfly_out[0][0], OUT.template to_vector<float>());
+        }
+
+        if constexpr (PROFILING) {
+          butterfly_cycles += get_cycles() - butterfly_start;
+        }
+        for (unsigned q = q0; q < q_lim; ++q) {
+          const unsigned t = q - q0;
           const unsigned out_idx0 = q + s * (4 * p + 0);
           const unsigned out_idx1 = q + s * (4 * p + 1);
           const unsigned out_idx2 = q + s * (4 * p + 2);
           const unsigned out_idx3 = q + s * (4 * p + 3);
 
-          dst[2 * out_idx0] = y0_real;
-          dst[2 * out_idx0 + 1] = y0_imag;
-          dst[2 * out_idx1] = y1_real;
-          dst[2 * out_idx1 + 1] = y1_imag;
-          dst[2 * out_idx2] = y2_real;
-          dst[2 * out_idx2 + 1] = y2_imag;
-          dst[2 * out_idx3] = y3_real;
-          dst[2 * out_idx3 + 1] = y3_imag;
+          dst[2 * out_idx0] = butterfly_out[t][0];
+          dst[2 * out_idx0 + 1] = butterfly_out[t][1];
+          dst[2 * out_idx1] = butterfly_out[t][2];
+          dst[2 * out_idx1 + 1] = butterfly_out[t][3];
+          dst[2 * out_idx2] = butterfly_out[t][4];
+          dst[2 * out_idx2 + 1] = butterfly_out[t][5];
+          dst[2 * out_idx3] = butterfly_out[t][6];
+          dst[2 * out_idx3 + 1] = butterfly_out[t][7];
         }
       }
     }
 
     // Each stage uses 3 twiddle factors per q: W^(q*m), W^(2*q*m), W^(3*q*m)
     // Each complex twiddle is 8 bf16 values (4 real splits + 4 imag splits)
-    stage_twiddle_base += 24 * s; // 3 twiddles * 8 bf16 values per twiddle
+    stage_twiddle_base += kTwiddleBlockPerQ * s;
   }
 
   // If number of stages is even, final data sits in x; copy to y.
@@ -343,6 +349,11 @@ static inline void fft_stockham_gemm(float *__restrict x,
       y[i] = x[i];
     }
   }
+
+  if constexpr (PROFILING) {
+    g_fft_elemwise_cycles = elemwise_cycles;
+    g_fft_butterfly_cycles = butterfly_cycles;
+  }
 }
 
 // Wrapper functions
@@ -350,8 +361,25 @@ extern "C" {
 
 void fft_stockham_f32(float *input, const bfloat16 *twiddle, 
                       float *output) {
+  unsigned long long start = 0;
+  unsigned long long end = 0;
+  if constexpr (PROFILING) {
+    event0();
+    start = get_cycles();
+  }
+
   // Perform FFT using Stockham algorithm with GEMM-based complex multiplication
   fft_stockham_gemm<FFT_SIZE>(input, twiddle, output);
+
+  if constexpr (PROFILING) {
+    end = get_cycles();
+    event1();
+    g_fft_stockham_cycles = end - start;
+    *((unsigned long long *)output + 0) = g_fft_stockham_cycles;
+    *((unsigned long long *)output + 1) = g_fft_elemwise_cycles;
+    *((unsigned long long *)output + 2) = g_fft_butterfly_cycles;
+  }
+
 }
 
 void zero_f32(float *c) {

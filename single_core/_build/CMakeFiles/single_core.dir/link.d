@@ -4,6 +4,7 @@ single_core: \
   /usr/lib/gcc/x86_64-linux-gnu/13/crtbeginS.o \
   CMakeFiles/single_core.dir/single_core/test.cpp.o \
   /opt/xilinx/xrt/lib/libxrt_coreutil.so \
+  /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/libfftw3.so \
   /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/libfftw3f.so \
   /home/diac/private/mlir-aie/ironenv/lib/python3.12/site-packages/mlir_aie/runtime_lib/x86_64/test_lib/lib/libtest_utils.a \
   /usr/lib/gcc/x86_64-linux-gnu/13/libstdc++.so \
@@ -44,6 +45,8 @@ single_core: \
 CMakeFiles/single_core.dir/single_core/test.cpp.o:
 
 /opt/xilinx/xrt/lib/libxrt_coreutil.so:
+
+/usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/libfftw3.so:
 
 /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/libfftw3f.so:
 

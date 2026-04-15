@@ -58,6 +58,7 @@ target_link_directories(${currentTarget} PUBLIC
 
 target_link_libraries(${currentTarget} PUBLIC
     xrt_coreutil
+    fftw3
     fftw3f
 )
 
