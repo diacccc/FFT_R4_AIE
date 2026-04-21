@@ -26,6 +26,7 @@
 #include "xrt/xrt_kernel.h"
 
 #include "common.h"
+#include "utils.hpp"
 
 #ifndef DATATYPES_USING_DEFINED
 #define DATATYPES_USING_DEFINED
@@ -338,6 +339,7 @@ int main(int argc, const char *argv[]) {
         // Compute reference FFT using double-precision FFTW.
         std::vector<double> RefOutput(OUTPUT_VOLUME, 0.0);
 
+#if 0
         // Allocate FFTW arrays (double precision).
         fftw_complex *fft_in =
           (fftw_complex *)fftw_malloc(sizeof(fftw_complex) * FFT_SIZE);
@@ -354,17 +356,18 @@ int main(int argc, const char *argv[]) {
       fftw_plan plan =
           fftw_plan_dft_1d(FFT_SIZE, fft_in, fft_out, FFTW_FORWARD, FFTW_ESTIMATE);
       fftw_execute(plan);
-      
+#endif 
+      fft_r4_stage1_ref<float, double>(InputVec, RefOutput, FFT_SIZE);
       // Copy FFTW output to RefOutput
-      for (int i = 0; i < FFT_SIZE; i++) {
-        RefOutput[2*i] = fft_out[i][0];     // real part
-        RefOutput[2*i+1] = fft_out[i][1];   // imaginary part
-      }
+      // for (int i = 0; i < FFT_SIZE; i++) {
+      //   RefOutput[2*i] = fft_out[i][0];     // real part
+      //   RefOutput[2*i+1] = fft_out[i][1];   // imaginary part
+      // }
       
       // Clean up FFTW.
-      fftw_destroy_plan(plan);
-      fftw_free(fft_in);
-      fftw_free(fft_out);
+      // fftw_destroy_plan(plan);
+      // fftw_free(fft_in);
+      // fftw_free(fft_out);
       
       // Compare results
       errors = 0;
@@ -380,9 +383,10 @@ int main(int argc, const char *argv[]) {
           static_cast<int>(sizeof(OUTPUT_DATATYPE));
       
       for (int i = 0; i < OUTPUT_VOLUME; i++) {
+#ifdef PROFILING
         if (i < profile_words)
           continue;
-
+#endif
         double out_val = static_cast<double>(OutputVec[i]);
         double diff = std::abs(out_val - RefOutput[i]);
         double ref_val = std::abs(RefOutput[i]);
@@ -431,10 +435,10 @@ int main(int argc, const char *argv[]) {
           for (int i = 0; i < FFT_SIZE; i++) {
             int real_idx = 2*i;
             int imag_idx = 2*i + 1;
-
+#ifdef PROFILING
             if (real_idx < profile_words || imag_idx < profile_words)
               continue;
-            
+#endif
             double real_expected = RefOutput[real_idx];
             double real_obtained = static_cast<double>(OutputVec[real_idx]);
             double real_abs_error = std::abs(real_obtained - real_expected);
