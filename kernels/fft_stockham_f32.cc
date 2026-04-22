@@ -369,8 +369,9 @@ void fft_stockham_f32(float *input, const bfloat16 *twiddle,
   }
 
   // Perform FFT using Stockham algorithm with GEMM-based complex multiplication
-  fft_stockham_gemm<FFT_SIZE>(input, twiddle, output);
-
+  for (int r = 0; r < 10000; ++r) {
+    fft_stockham_gemm<FFT_SIZE>(input, twiddle, output);
+  }
   if constexpr (PROFILING) {
     end = get_cycles();
     event1();
