@@ -10,6 +10,8 @@
 
 #define NOCPP
 
+#define __AIEARCH__ 21
+
 #include <aie_api/aie.hpp>
 
 #ifndef FFT_SIZE
@@ -18,7 +20,7 @@
 
 // Radix-4 FFT requires N to be a power of 4
 
-#define PROFILING 0
+#define PROFILING 1
 
 
 static volatile unsigned long long g_fft_stockham_cycles = 0;
@@ -77,27 +79,11 @@ static inline void fft_stockham_gemm(float *__restrict x,
 // Stage 0 in contiguous-butterfly layout:
 // input butterflies:  [x[4p+0], x[4p+1], x[4p+2], x[4p+3]]
 // output layout:      y[p + r*m], r=0..3, m=N/4
-
-  if constexpr (LOG4N > 0) {
-    constexpr unsigned Q_TILE = 4;
+    constexpr unsigned Q_TILE = 8;
     constexpr unsigned stage0 = 0;
     constexpr unsigned M_FLAT = Q_TILE * 8;
-
-    const unsigned n = N >> (2 * stage0);  // n = N
-    const unsigned s = 1u << (2 * stage0); // s = 1
-    const unsigned m = n >> 2;             // m = N / 4
-
-    for (unsigned p0 = 0; p0 < m; p0 += Q_TILE) {
-      const unsigned p_lim = ((p0 + Q_TILE) < m) ? (p0 + Q_TILE) : m;
-      const unsigned rows = p_lim - p0;
-
-      // unsigned long long butterfly_start = 0;
-      // if constexpr (PROFILING) {
-      //   butterfly_start = get_cycles();
-      // }
-      float butterfly_out[Q_TILE][8];
-
-      alignas(aie::vector_decl_align) static bfloat16 coeff_buf[64] = {
+    
+    alignas(aie::vector_decl_align) static bfloat16 coeff_buf[64] = {
         1,  0,  1,  0,  1,  0,  1,  0,
         0,  1,  0,  1,  0,  1,  0,  1,
         1,  0,  0, -1, -1,  0,  0,  1,
@@ -106,43 +92,29 @@ static inline void fft_stockham_gemm(float *__restrict x,
         0,  1,  0, -1,  0,  1,  0, -1,
         1,  0,  0,  1, -1,  0,  0, -1,
         0,  1, -1,  0,  0, -1,  1,  0,
-      };
-      aie::vector<bfloat16, 64> coeff_vecs;
-      coeff_vecs = aie::load_v<64>(coeff_buf);
+    };
+    aie::vector<bfloat16, 64> coeff_vecs;
+    coeff_vecs = aie::load_v<64>(coeff_buf);
+    const unsigned n = N >> (2 * stage0);  // n = N
+    const unsigned m = (n >> 2)/Q_TILE; 
+
+    for (unsigned p0 = 0; p0 < m; p0++) chess_prepare_for_pipelining chess_loop_range(m, m){
       aie::accum<accfloat, M_FLAT> in_vecs;
-      in_vecs = aie::load_v<M_FLAT>(x + 2 * p0 * 4);
+      in_vecs = aie::load_v<M_FLAT>(x + 2 * p0 * Q_TILE * 4);
       aie::accum<accfloat, M_FLAT> tmp_splits;
 
       using MMUL = aie::mmul<Q_TILE, 8, 8, bfloat16, bfloat16, accfloat>;
       MMUL OUT;
       aie::vector<bfloat16, M_FLAT> in_splits = in_vecs.template to_vector<bfloat16>();
       OUT.mul(in_splits, coeff_vecs);
-      for (unsigned k = 1; k < kSplitCount; ++k) {
+      for (unsigned k = 1; k < kSplitCount; ++k){
         tmp_splits.from_vector(in_splits);
         in_vecs = aie::sub(in_vecs, tmp_splits);
         in_splits = in_vecs.template to_vector<bfloat16>();
         OUT.mac(in_splits, coeff_vecs);
       }
-      aie::store_v(&butterfly_out[0][0], OUT.template to_vector<float>());
-
-      for (unsigned p = p0; p < p_lim; ++p) {
-          const unsigned t = p - p0;
-          const unsigned out_idx0 = p + 0 * m;
-          const unsigned out_idx1 = p + 1 * m;
-          const unsigned out_idx2 = p + 2 * m;
-          const unsigned out_idx3 = p + 3 * m;
-
-          y[2 * out_idx0] = butterfly_out[t][0];
-          y[2 * out_idx0 + 1] = butterfly_out[t][1];
-          y[2 * out_idx1] = butterfly_out[t][2];
-          y[2 * out_idx1 + 1] = butterfly_out[t][3];
-          y[2 * out_idx2] = butterfly_out[t][4];
-          y[2 * out_idx2 + 1] = butterfly_out[t][5];
-          y[2 * out_idx3] = butterfly_out[t][6];
-          y[2 * out_idx3 + 1] = butterfly_out[t][7];
-      }
+      aie::store_v(y + 2 * p0 * Q_TILE * 4, OUT.template to_vector<float>());
     }
-  }
 
 
   // // Preserve twiddle table compatibility by skipping the stage-0 slot.
@@ -345,11 +317,13 @@ void fft_stockham_f32(float *input, const bfloat16 *twiddle,
   }
 
   // Perform FFT using Stockham algorithm with GEMM-based complex multiplication
+  for (int r = 0; r < 10000; ++r)
   fft_stockham_gemm<FFT_SIZE>(input, twiddle, output);
 
   if constexpr (PROFILING) {
     end = get_cycles();
     event1();
+   
     g_fft_stockham_cycles = end - start;
     *((unsigned long long *)output + 0) = g_fft_stockham_cycles;
     *((unsigned long long *)output + 1) = g_fft_elemwise_cycles;
