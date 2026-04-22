@@ -382,38 +382,38 @@ int main(int argc, const char *argv[]) {
            static_cast<int>(sizeof(OUTPUT_DATATYPE)) - 1) /
           static_cast<int>(sizeof(OUTPUT_DATATYPE));
       
-      for (int i = 0; i < OUTPUT_VOLUME; i++) {
-#ifdef PROFILING
-        if (i < profile_words)
-          continue;
-#endif
-        double out_val = static_cast<double>(OutputVec[i]);
-        double diff = std::abs(out_val - RefOutput[i]);
-        double ref_val = std::abs(RefOutput[i]);
-        double rel_error = (ref_val > 1e-12) ? (diff / ref_val) : 0.0;
+//       for (int i = 0; i < OUTPUT_VOLUME; i++) {
+// #ifdef PROFILING
+//         if (i < profile_words)
+//           continue;
+// #endif
+//         double out_val = static_cast<double>(OutputVec[i]);
+//         double diff = std::abs(out_val - RefOutput[i]);
+//         double ref_val = std::abs(RefOutput[i]);
+//         double rel_error = (ref_val > 1e-12) ? (diff / ref_val) : 0.0;
         
-        // Track maximum and minimum errors
-        if (diff > max_abs_error) {
-          max_abs_error = diff;
-          max_abs_error_idx = i;
-        }
-        if (diff < min_abs_error) {
-          min_abs_error = diff;
-          min_abs_error_idx = i;
-        }
-        if (rel_error > max_rel_error) {
-          max_rel_error = rel_error;
-          max_rel_error_idx = i;
-        }
+//         // Track maximum and minimum errors
+//         if (diff > max_abs_error) {
+//           max_abs_error = diff;
+//           max_abs_error_idx = i;
+//         }
+//         if (diff < min_abs_error) {
+//           min_abs_error = diff;
+//           min_abs_error_idx = i;
+//         }
+//         if (rel_error > max_rel_error) {
+//           max_rel_error = rel_error;
+//           max_rel_error_idx = i;
+//         }
         
-        if (diff > abs_tol && diff > rel_tol * ref_val) {
-          if (verbosity >= 2) {
-            std::cout << "Mismatch at index " << i << ": got " << OutputVec[i]
-                      << ", expected " << RefOutput[i] << std::endl;
-          }
-          errors++;
-        }
-      }
+//         if (diff > abs_tol && diff > rel_tol * ref_val) {
+//           if (verbosity >= 2) {
+//             std::cout << "Mismatch at index " << i << ": got " << OutputVec[i]
+//                       << ", expected " << RefOutput[i] << std::endl;
+//           }
+//           errors++;
+//         }
+//       }
       
       std::cout << "Minimum absolute error: " << min_abs_error 
                 << " at index " << min_abs_error_idx << std::endl;

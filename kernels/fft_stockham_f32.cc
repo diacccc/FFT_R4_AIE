@@ -81,11 +81,11 @@ static inline void fft_stockham_gemm(float *__restrict x,
   if constexpr (LOG4N > 0) {
     constexpr unsigned Q_TILE = 4;
     constexpr unsigned stage0 = 0;
+    constexpr unsigned M_FLAT = Q_TILE * 8;
+
     const unsigned n = N >> (2 * stage0);  // n = N
     const unsigned s = 1u << (2 * stage0); // s = 1
     const unsigned m = n >> 2;             // m = N / 4
-
-    float butterfly_out[Q_TILE][8];
 
     for (unsigned p0 = 0; p0 < m; p0 += Q_TILE) {
       const unsigned p_lim = ((p0 + Q_TILE) < m) ? (p0 + Q_TILE) : m;
@@ -95,6 +95,7 @@ static inline void fft_stockham_gemm(float *__restrict x,
       // if constexpr (PROFILING) {
       //   butterfly_start = get_cycles();
       // }
+      float butterfly_out[Q_TILE][8];
 
       alignas(aie::vector_decl_align) static bfloat16 coeff_buf[64] = {
         1,  0,  1,  0,  1,  0,  1,  0,
@@ -108,13 +109,13 @@ static inline void fft_stockham_gemm(float *__restrict x,
       };
       aie::vector<bfloat16, 64> coeff_vecs;
       coeff_vecs = aie::load_v<64>(coeff_buf);
-      aie::accum<accfloat, 32> in_vecs;
-      in_vecs = aie::load_v<32>(x + 2 * p0 * 4);
-      aie::accum<accfloat, 32> tmp_splits;
+      aie::accum<accfloat, M_FLAT> in_vecs;
+      in_vecs = aie::load_v<M_FLAT>(x + 2 * p0 * 4);
+      aie::accum<accfloat, M_FLAT> tmp_splits;
 
-      using MMUL = aie::mmul<4, 8, 8, bfloat16, bfloat16, accfloat>;
+      using MMUL = aie::mmul<Q_TILE, 8, 8, bfloat16, bfloat16, accfloat>;
       MMUL OUT;
-      aie::vector<bfloat16, 32> in_splits = in_vecs.template to_vector<bfloat16>();
+      aie::vector<bfloat16, M_FLAT> in_splits = in_vecs.template to_vector<bfloat16>();
       OUT.mul(in_splits, coeff_vecs);
       for (unsigned k = 1; k < kSplitCount; ++k) {
         tmp_splits.from_vector(in_splits);
@@ -123,33 +124,8 @@ static inline void fft_stockham_gemm(float *__restrict x,
         OUT.mac(in_splits, coeff_vecs);
       }
       aie::store_v(&butterfly_out[0][0], OUT.template to_vector<float>());
-      
-      if (rows == Q_TILE) {
-        aie::vector<float, 8> r0 = aie::load_v<8>(&butterfly_out[0][0]);
-        aie::vector<float, 8> r1 = aie::load_v<8>(&butterfly_out[1][0]);
-        aie::vector<float, 8> r2 = aie::load_v<8>(&butterfly_out[2][0]);
-        aie::vector<float, 8> r3 = aie::load_v<8>(&butterfly_out[3][0]);
 
-        alignas(aie::vector_decl_align) float tmp0[8] = {
-          r0[0], r0[1], r1[0], r1[1], r2[0], r2[1], r3[0], r3[1]
-        };
-        alignas(aie::vector_decl_align) float tmp1[8] = {
-          r0[2], r0[3], r1[2], r1[3], r2[2], r2[3], r3[2], r3[3]
-        };
-        alignas(aie::vector_decl_align) float tmp2[8] = {
-          r0[4], r0[5], r1[4], r1[5], r2[4], r2[5], r3[4], r3[5]
-        };
-        alignas(aie::vector_decl_align) float tmp3[8] = {
-          r0[6], r0[7], r1[6], r1[7], r2[6], r2[7], r3[6], r3[7]
-        };
-
-        aie::store_v(&y[2 * (p0 + 0 * m)], aie::load_v<8>(tmp0));
-        aie::store_v(&y[2 * (p0 + 1 * m)], aie::load_v<8>(tmp1));
-        aie::store_v(&y[2 * (p0 + 2 * m)], aie::load_v<8>(tmp2));
-        aie::store_v(&y[2 * (p0 + 3 * m)], aie::load_v<8>(tmp3));
-      } else {
-        // tail fallback
-        for (unsigned p = p0; p < p_lim; ++p) {
+      for (unsigned p = p0; p < p_lim; ++p) {
           const unsigned t = p - p0;
           const unsigned out_idx0 = p + 0 * m;
           const unsigned out_idx1 = p + 1 * m;
@@ -164,7 +140,6 @@ static inline void fft_stockham_gemm(float *__restrict x,
           y[2 * out_idx2 + 1] = butterfly_out[t][5];
           y[2 * out_idx3] = butterfly_out[t][6];
           y[2 * out_idx3 + 1] = butterfly_out[t][7];
-        }
       }
     }
   }
