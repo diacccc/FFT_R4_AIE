@@ -60,6 +60,13 @@ float rel_tol = matmul_common::get_rel_tol<OUTPUT_DATATYPE>();
 
 constexpr int kProfilingU64Count = 3;
 
+static inline int digit_reverse_base4_64(int n) {
+    int n0 = n & 3;          // n % 4
+    int n1 = (n >> 2) & 3;   // (n / 4) % 4
+    int n2 = (n >> 4) & 3;   // n / 16
+    return 16 * n0 + 4 * n1 + n2;
+}
+
 int main(int argc, const char *argv[]) {
   // Program arguments parsing
   cxxopts::Options options("FFT Test");
@@ -188,10 +195,17 @@ int main(int argc, const char *argv[]) {
   // Restrict values to range [-1, 1]
   INPUT_DATATYPE *bufInput = bo_input.map<INPUT_DATATYPE *>();
   std::vector<INPUT_DATATYPE> InputVec(INPUT_VOLUME);
+  std::vector<INPUT_DATATYPE> input_br(INPUT_VOLUME); // Bit-reversed input for FFT
   for (int i = 0; i < INPUT_VOLUME; i++) {
     // Generate random value in range [-1, 1]
     float rand_val = -1.0f + 2.0f * (static_cast<float>(rand()) / RAND_MAX);
-    InputVec[i] = static_cast<INPUT_DATATYPE>(rand_val);
+    input_br[i] = static_cast<INPUT_DATATYPE>(rand_val);
+  }
+  for (int n = 0; n < FFT_SIZE; ++n) {
+      int nr = digit_reverse_base4_64(n);
+
+      InputVec[2 * n]     = input_br[2 * nr];
+      InputVec[2 * n + 1] = input_br[2 * nr + 1];
   }
   memcpy(bufInput, InputVec.data(), (InputVec.size() * sizeof(INPUT_DATATYPE)));
   
@@ -339,7 +353,7 @@ int main(int argc, const char *argv[]) {
         // Compute reference FFT using double-precision FFTW.
         std::vector<double> RefOutput(OUTPUT_VOLUME, 0.0);
 
-#if 0
+#if 1
         // Allocate FFTW arrays (double precision).
         fftw_complex *fft_in =
           (fftw_complex *)fftw_malloc(sizeof(fftw_complex) * FFT_SIZE);
@@ -348,26 +362,30 @@ int main(int argc, const char *argv[]) {
       
       // Copy input data to FFTW format
       for (int i = 0; i < FFT_SIZE; i++) {
-        fft_in[i][0] = static_cast<double>(InputVec[2 * i]);     // real part
-        fft_in[i][1] = static_cast<double>(InputVec[2 * i + 1]); // imaginary part
+        fft_in[i][0] = static_cast<double>(input_br[2 * i]);     // real part
+        fft_in[i][1] = static_cast<double>(input_br[2 * i + 1]); // imaginary part
       }
 
       // Create FFTW plan and execute.
       fftw_plan plan =
           fftw_plan_dft_1d(FFT_SIZE, fft_in, fft_out, FFTW_FORWARD, FFTW_ESTIMATE);
       fftw_execute(plan);
-#endif 
-      fft_r4_stage1_ref<float, double>(InputVec, RefOutput, FFT_SIZE);
+#endif
+      // std::vector<double> stage1_output(OUTPUT_VOLUME);
+      // std::vector<double> stage2_output(OUTPUT_VOLUME);
+      // fft_r4_stage1_ref<float, double>(InputVec, stage1_output, FFT_SIZE);
+      // fft_r4_stage2_ref<double, double>(stage1_output, RefOutput, FFT_SIZE);
+      // fft_r4_stage3_ref<double, double>(stage2_output, RefOutput, FFT_SIZE);
       // Copy FFTW output to RefOutput
-      // for (int i = 0; i < FFT_SIZE; i++) {
-      //   RefOutput[2*i] = fft_out[i][0];     // real part
-      //   RefOutput[2*i+1] = fft_out[i][1];   // imaginary part
-      // }
+      for (int i = 0; i < FFT_SIZE; i++) {
+        RefOutput[2*i] = fft_out[i][0];     // real part
+        RefOutput[2*i+1] = fft_out[i][1];   // imaginary part
+      }
       
       // Clean up FFTW.
-      // fftw_destroy_plan(plan);
-      // fftw_free(fft_in);
-      // fftw_free(fft_out);
+      fftw_destroy_plan(plan);
+      fftw_free(fft_in);
+      fftw_free(fft_out);
       
       // Compare results
       errors = 0;
